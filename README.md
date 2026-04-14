@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/26690850/README.md)
 # Anonymised Facial Expression Recognition
 
 This project is a course group project for `COMP4026 Computer Vision and Pattern Recognition`.
@@ -144,13 +143,15 @@ This script evaluates:
 Using held-out task-specific test sets:
 
 - face recognition accuracy dropped from `98.3%` to `23.2%`
-- expression accuracy changed from `68.0%` to `67.5%`
-- expression consistency reached `92.8%`
+- expression model achieved `70.7%` best validation accuracy and `69.7%` final FER-2013 test accuracy
+- expression accuracy changed from `69.70%` to `69.42%` after anonymization
+- expression accuracy drop was only `0.28%`
+- expression consistency reached `91.91%`
 
 These results show a useful privacy-utility trade-off:
 
 - identity information is significantly reduced after anonymization
-- expression information is largely preserved
+- expression information is largely preserved, with only a very small drop in expression recognition accuracy
 
 ## Notes
 
