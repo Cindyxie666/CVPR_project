@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import precision_recall_fscore_support
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models as tv_models, transforms
 from torchvision.utils import save_image
@@ -50,6 +51,30 @@ from models.losses import prep_arcface, prep_expression
 PINS_DIR = "./pins_face/105_classes_pins_dataset"
 FER_DIR = "./expression_recognition/expression_recognition/data/test"
 SPLIT_PATH = "./pretrained/split_indices.pt"
+
+
+def _classification_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray,
+) -> dict[str, float]:
+    """Compute accuracy, macro-precision, macro-recall, macro-F1."""
+    acc = (y_true == y_pred).mean() * 100
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0,
+    )
+    return {
+        "accuracy": acc,
+        "precision": p * 100,
+        "recall": r * 100,
+        "f1": f1 * 100,
+    }
+
+
+def _print_metrics(header: str, m: dict[str, float]) -> None:
+    print(f"  {header}")
+    print(f"    Accuracy  : {m['accuracy']:.1f}%")
+    print(f"    Precision : {m['precision']:.1f}%  (macro)")
+    print(f"    Recall    : {m['recall']:.1f}%  (macro)")
+    print(f"    F1 Score  : {m['f1']:.1f}%  (macro)")
 
 
 # ────────────────────── Model loaders ──────────────────────
@@ -137,9 +162,9 @@ def evaluate_privacy(
             "generate the train/test split."
         )
     split = torch.load(split_path, map_location="cpu", weights_only=True)
-    val_indices = split["val_indices"]
-    test_ds = Subset(full_ds, val_indices)
-    print(f"Held-out test set: {len(val_indices)} images (from {split_path})")
+    test_indices = split["test_indices"]
+    test_ds = Subset(full_ds, test_indices)
+    print(f"Held-out test set: {len(test_indices)} images (from {split_path})")
 
     loader = DataLoader(
         test_ds, batch_size=batch_size, shuffle=False,
@@ -148,6 +173,7 @@ def evaluate_privacy(
 
     class_embs: dict[int, list[torch.Tensor]] = {}
     all_cos: list[float] = []
+    emb_orig_all: list[torch.Tensor] = []
     emb_anon_all: list[torch.Tensor] = []
     label_all: list[torch.Tensor] = []
     sample_orig, sample_anon = [], []
@@ -159,6 +185,7 @@ def evaluate_privacy(
         emb_o = arcface(prep_arcface(images))
         emb_a = arcface(prep_arcface(anonymized))
 
+        emb_orig_all.append(emb_o.cpu())
         emb_anon_all.append(emb_a.cpu())
         label_all.append(labels)
 
@@ -180,30 +207,42 @@ def evaluate_privacy(
     gallery_classes = sorted(centroids_dict.keys())
     gallery = torch.stack([centroids_dict[c] for c in gallery_classes])
 
-    # Re-ID: match each anonymised embedding to the nearest centroid
+    all_emb_orig = torch.cat(emb_orig_all)
     all_emb_anon = torch.cat(emb_anon_all)
-    all_labels_t = torch.cat(label_all)
+    gt = torch.cat(label_all).numpy()
 
-    sims = all_emb_anon @ gallery.T
-    predicted = torch.tensor(
-        [gallery_classes[i] for i in sims.argmax(dim=1).tolist()]
-    )
-    reid_correct = (predicted == all_labels_t).sum().item()
-    total = len(all_labels_t)
-    reid_rate = reid_correct / total * 100
+    # Nearest-centroid classification on originals (baseline)
+    sims_orig = all_emb_orig @ gallery.T
+    pred_orig = np.array([gallery_classes[i] for i in sims_orig.argmax(dim=1).tolist()])
+
+    # Nearest-centroid classification on anonymised
+    sims_anon = all_emb_anon @ gallery.T
+    pred_anon = np.array([gallery_classes[i] for i in sims_anon.argmax(dim=1).tolist()])
+
+    orig_metrics = _classification_metrics(gt, pred_orig)
+    anon_metrics = _classification_metrics(gt, pred_anon)
 
     cosine_sims = np.array(all_cos)
     mean_cos = cosine_sims.mean()
 
-    print(f"\n  Images evaluated       : {total}")
+    print(f"\n  Images evaluated       : {len(gt)}")
     print(f"  Mean cos(orig, anon)   : {mean_cos:.4f}  (lower = better privacy)")
-    print(f"  Re-ID rate             : {reid_rate:.1f}%  (lower = better)")
-    print(f"  Re-ID accuracy drop    : {100 - reid_rate:.1f}%")
+    print()
+    _print_metrics("ArcFace on ORIGINAL faces (baseline):", orig_metrics)
+    print()
+    _print_metrics("ArcFace on ANONYMISED faces:", anon_metrics)
+    print()
+    print(f"  Accuracy drop          : "
+          f"{orig_metrics['accuracy'] - anon_metrics['accuracy']:.1f}%")
+    print(f"  F1 drop                : "
+          f"{orig_metrics['f1'] - anon_metrics['f1']:.1f}%")
 
     # Visualisation
-    orig = torch.cat(sample_orig, dim=0)[:16]
-    anon = torch.cat(sample_anon, dim=0)[:16]
-    pairs = torch.stack([orig, anon], dim=1).reshape(-1, *orig.shape[1:])
+    orig_imgs = torch.cat(sample_orig, dim=0)[:16]
+    anon_imgs = torch.cat(sample_anon, dim=0)[:16]
+    pairs = torch.stack([orig_imgs, anon_imgs], dim=1).reshape(
+        -1, *orig_imgs.shape[1:],
+    )
     grid_path = os.path.join(output_dir, "privacy_comparison.png")
     save_image(pairs * 0.5 + 0.5, grid_path, nrow=4, padding=2)
     print(f"  Comparison grid        : {grid_path}")
@@ -215,7 +254,7 @@ def evaluate_privacy(
     ax.set_ylabel("Count")
     ax.set_title(
         f"Privacy: Identity Distance (Pins Face Test Set)\n"
-        f"Mean={mean_cos:.3f} | Re-ID={reid_rate:.1f}%"
+        f"Mean={mean_cos:.3f} | Re-ID={anon_metrics['accuracy']:.1f}%"
     )
     ax.legend()
     hist_path = os.path.join(output_dir, "privacy_cosine_hist.png")
@@ -223,7 +262,10 @@ def evaluate_privacy(
     plt.close(fig)
     print(f"  Cosine histogram       : {hist_path}")
 
-    return {"reid_rate": reid_rate, "mean_cos": mean_cos, "total": total}
+    return {
+        "orig": orig_metrics, "anon": anon_metrics,
+        "mean_cos": mean_cos, "total": len(gt),
+    }
 
 
 # ────────────────────── Test 2: Utility (FER-2013) ──────────────────────
@@ -258,10 +300,9 @@ def evaluate_utility(
         num_workers=2, pin_memory=True,
     )
 
-    total = 0
-    orig_correct = 0
-    anon_correct = 0
-    consistent = 0
+    all_gt: list[int] = []
+    all_pred_orig: list[int] = []
+    all_pred_anon: list[int] = []
     sample_orig, sample_anon = [], []
 
     for images, labels in tqdm(loader, desc="Utility eval"):
@@ -272,37 +313,48 @@ def evaluate_utility(
         pred_orig = expr_model(prep_expression(images)).argmax(dim=1)
         pred_anon = expr_model(prep_expression(anonymized)).argmax(dim=1)
 
-        orig_correct += (pred_orig == labels).sum().item()
-        anon_correct += (pred_anon == labels).sum().item()
-        consistent += (pred_orig == pred_anon).sum().item()
-        total += images.size(0)
+        all_gt.extend(labels.cpu().tolist())
+        all_pred_orig.extend(pred_orig.cpu().tolist())
+        all_pred_anon.extend(pred_anon.cpu().tolist())
 
         if len(sample_orig) < 16:
             sample_orig.append(images[:4].cpu())
             sample_anon.append(anonymized[:4].cpu())
 
-    orig_acc = orig_correct / total * 100
-    anon_acc = anon_correct / total * 100
-    consistency = consistent / total * 100
+    gt = np.array(all_gt)
+    po = np.array(all_pred_orig)
+    pa = np.array(all_pred_anon)
 
-    print(f"\n  Images evaluated       : {total}")
+    orig_metrics = _classification_metrics(gt, po)
+    anon_metrics = _classification_metrics(gt, pa)
+    consistency = (po == pa).mean() * 100
+
+    print(f"\n  Images evaluated       : {len(gt)}")
     print(f"  Expression classes     : {class_names}")
-    print(f"  Accuracy (original)    : {orig_acc:.1f}%")
-    print(f"  Accuracy (anonymised)  : {anon_acc:.1f}%")
-    print(f"  Accuracy drop          : {orig_acc - anon_acc:.1f}%")
+    print()
+    _print_metrics("Expression on ORIGINAL faces (baseline):", orig_metrics)
+    print()
+    _print_metrics("Expression on ANONYMISED faces:", anon_metrics)
+    print()
+    print(f"  Accuracy drop          : "
+          f"{orig_metrics['accuracy'] - anon_metrics['accuracy']:.1f}%")
+    print(f"  F1 drop                : "
+          f"{orig_metrics['f1'] - anon_metrics['f1']:.1f}%")
     print(f"  Expression consistency : {consistency:.1f}%  (higher = better)")
 
     # Visualisation
-    orig = torch.cat(sample_orig, dim=0)[:16]
-    anon = torch.cat(sample_anon, dim=0)[:16]
-    pairs = torch.stack([orig, anon], dim=1).reshape(-1, *orig.shape[1:])
+    orig_imgs = torch.cat(sample_orig, dim=0)[:16]
+    anon_imgs = torch.cat(sample_anon, dim=0)[:16]
+    pairs = torch.stack([orig_imgs, anon_imgs], dim=1).reshape(
+        -1, *orig_imgs.shape[1:],
+    )
     grid_path = os.path.join(output_dir, "utility_comparison.png")
     save_image(pairs * 0.5 + 0.5, grid_path, nrow=4, padding=2)
     print(f"  Comparison grid        : {grid_path}")
 
     return {
-        "orig_acc": orig_acc, "anon_acc": anon_acc,
-        "consistency": consistency, "total": total,
+        "orig": orig_metrics, "anon": anon_metrics,
+        "consistency": consistency, "total": len(gt),
     }
 
 
@@ -367,16 +419,34 @@ def main() -> None:
     )
 
     # ── Summary ──
+    po = privacy["orig"]
+    pa = privacy["anon"]
+    uo = utility["orig"]
+    ua = utility["anon"]
+
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"  [Privacy]  Re-ID rate       : {privacy['reid_rate']:.1f}%  (lower = better)")
-    print(f"  [Privacy]  Mean cosine      : {privacy['mean_cos']:.4f}")
-    print(f"  [Utility]  Expr acc (orig)  : {utility['orig_acc']:.1f}%")
-    print(f"  [Utility]  Expr acc (anon)  : {utility['anon_acc']:.1f}%")
-    print(f"  [Utility]  Consistency      : {utility['consistency']:.1f}%  (higher = better)")
+    print("  PRIVACY (ArcFace re-identification on Pins Face)")
+    print(f"    Mean cosine (orig↔anon)  : {privacy['mean_cos']:.4f}")
+    print(f"    Original  → Acc {po['accuracy']:5.1f}%  "
+          f"P {po['precision']:5.1f}%  R {po['recall']:5.1f}%  F1 {po['f1']:5.1f}%")
+    print(f"    Anonymised→ Acc {pa['accuracy']:5.1f}%  "
+          f"P {pa['precision']:5.1f}%  R {pa['recall']:5.1f}%  F1 {pa['f1']:5.1f}%")
+    print(f"    Drop       → Acc {po['accuracy'] - pa['accuracy']:-5.1f}%  "
+          f"F1 {po['f1'] - pa['f1']:-5.1f}%")
+    print()
+    print("  UTILITY (Expression recognition on FER-2013)")
+    print(f"    Original  → Acc {uo['accuracy']:5.1f}%  "
+          f"P {uo['precision']:5.1f}%  R {uo['recall']:5.1f}%  F1 {uo['f1']:5.1f}%")
+    print(f"    Anonymised→ Acc {ua['accuracy']:5.1f}%  "
+          f"P {ua['precision']:5.1f}%  R {ua['recall']:5.1f}%  F1 {ua['f1']:5.1f}%")
+    print(f"    Drop       → Acc {uo['accuracy'] - ua['accuracy']:-5.1f}%  "
+          f"F1 {uo['f1'] - ua['f1']:-5.1f}%")
+    print(f"    Consistency: {utility['consistency']:.1f}%")
     print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
+
