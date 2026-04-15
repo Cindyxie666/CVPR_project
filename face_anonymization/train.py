@@ -239,3 +239,6 @@ def parse_args() -> Config:
 
 if __name__ == "__main__":
     train(parse_args())
+
+if __name__ == "__main__":
+    train(parse_args())
