@@ -41,7 +41,7 @@ BATCH_SIZE = 64
 def _build_test_loader(
     data_dir: str, split_path: str,
 ) -> tuple[DataLoader, list[str]]:
-    """Build a DataLoader for the held-out test (val) set only."""
+    """Build a DataLoader for the held-out test set only."""
     tf = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
@@ -51,13 +51,13 @@ def _build_test_loader(
 
     if os.path.isfile(split_path):
         split = torch.load(split_path, map_location="cpu", weights_only=True)
-        val_indices = split["val_indices"]
-        test_ds = Subset(full_ds, val_indices)
-        print(f"Loaded split from {split_path}  →  test set: {len(val_indices)} images")
+        test_indices = split["test_indices"]
+        test_ds = Subset(full_ds, test_indices)
+        print(f"Loaded split from {split_path}  →  test set: {len(test_indices)} images")
     else:
         print(
             f"WARNING: {split_path} not found — evaluating on full dataset. "
-            "Run train_arcface.py first to create a proper train/test split."
+            "Run train_arcface.py first to create a proper train/val/test split."
         )
         test_ds = full_ds
 
