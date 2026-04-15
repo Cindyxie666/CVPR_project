@@ -81,7 +81,8 @@ class CosineClassifier(nn.Module):
 
 
 def build_loaders(
-    data_dir: str, image_size: int, batch_size: int, val_ratio: float = 0.2,
+    data_dir: str, image_size: int, batch_size: int,
+    val_ratio: float = 0.1, test_ratio: float = 0.15,
 ) -> tuple[DataLoader, DataLoader, int]:
     train_tf = transforms.Compose([
         transforms.Resize((image_size, image_size)),
@@ -101,18 +102,22 @@ def build_loaders(
     num_classes = len(full_ds.classes)
     n_total = len(full_ds)
 
+    test_size = max(1, int(n_total * test_ratio))
     val_size = max(1, int(n_total * val_ratio))
-    train_size = n_total - val_size
-    train_ds, val_ds = random_split(full_ds, [train_size, val_size])
+    train_size = n_total - val_size - test_size
+    train_ds, val_ds, test_ds = random_split(
+        full_ds, [train_size, val_size, test_size],
+    )
 
-    # Save split indices so eval_arcface.py can reproduce the exact test set
     split_path = os.path.join(os.path.dirname(OUTPUT_PATH) or ".", "split_indices.pt")
     os.makedirs(os.path.dirname(split_path) or ".", exist_ok=True)
     torch.save({
         "train_indices": train_ds.indices,
         "val_indices": val_ds.indices,
+        "test_indices": test_ds.indices,
     }, split_path)
-    print(f"Classes: {num_classes}  |  Train: {train_size}  |  Val: {val_size}")
+    print(f"Classes: {num_classes}  |  "
+          f"Train: {train_size}  |  Val: {val_size}  |  Test: {test_size}")
     print(f"Split indices saved to {split_path}")
 
     val_ds.dataset = datasets.ImageFolder(data_dir, transform=val_tf)
